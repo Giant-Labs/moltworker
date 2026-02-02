@@ -1,117 +1,136 @@
 #!/bin/bash
 # Startup script for Moltbot in Cloudflare Sandbox
-# This script:
-# 1. Restores config from R2 backup if available
-# 2. Configures moltbot from environment variables
-# 3. Starts a background sync to backup config to R2
-# 4. Starts the gateway
+#
+# Persistence strategy:
+# - Workspace (/root/clawd): Symlinked directly to R2 for immediate persistence
+# - Config (/root/.clawdbot): Backup/restore from R2 (modified by env vars on boot)
+#
+# Custom hooks:
+# - /data/moltbot/hooks/post-boot.sh: Runs after setup, before gateway starts
 
 set -e
 
-# Check if clawdbot gateway is already running - bail early if so
-# Note: CLI is still named "clawdbot" until upstream renames it
+# ============================================================
+# EARLY EXIT CHECK
+# ============================================================
 if pgrep -f "clawdbot gateway" > /dev/null 2>&1; then
     echo "Moltbot gateway is already running, exiting."
     exit 0
 fi
 
-# Paths (clawdbot paths are used internally - upstream hasn't renamed yet)
+# ============================================================
+# PATHS
+# ============================================================
 CONFIG_DIR="/root/.clawdbot"
 CONFIG_FILE="$CONFIG_DIR/clawdbot.json"
 TEMPLATE_DIR="/root/.clawdbot-templates"
 TEMPLATE_FILE="$TEMPLATE_DIR/moltbot.json.template"
-BACKUP_DIR="/data/moltbot"
+R2_MOUNT="/data/moltbot"
+WORKSPACE_LOCAL="/root/clawd"
+WORKSPACE_R2="$R2_MOUNT/clawd"
 
-echo "Config directory: $CONFIG_DIR"
-echo "Backup directory: $BACKUP_DIR"
+echo "=== Moltbot Startup ==="
+echo "Config: $CONFIG_DIR"
+echo "R2 Mount: $R2_MOUNT"
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
 
 # ============================================================
-# RESTORE FROM R2 BACKUP
+# WORKSPACE PERSISTENCE (symlink to R2)
 # ============================================================
-# Check if R2 backup exists by looking for clawdbot.json
-# The BACKUP_DIR may exist but be empty if R2 was just mounted
-# Note: backup structure is $BACKUP_DIR/clawdbot/ and $BACKUP_DIR/skills/
+# The workspace is symlinked directly to R2 so all writes persist immediately.
+# No backup/restore needed - files are always on R2.
 
-# Helper function to check if R2 backup is newer than local
-should_restore_from_r2() {
-    local R2_SYNC_FILE="$BACKUP_DIR/.last-sync"
-    local LOCAL_SYNC_FILE="$CONFIG_DIR/.last-sync"
+if [ -d "$R2_MOUNT" ]; then
+    echo "Setting up workspace persistence..."
     
-    # If no R2 sync timestamp, don't restore
-    if [ ! -f "$R2_SYNC_FILE" ]; then
-        echo "No R2 sync timestamp found, skipping restore"
-        return 1
+    # Create workspace on R2 if it doesn't exist
+    if [ ! -d "$WORKSPACE_R2" ]; then
+        echo "Creating workspace on R2: $WORKSPACE_R2"
+        mkdir -p "$WORKSPACE_R2"
     fi
     
-    # If no local sync timestamp, restore from R2
-    if [ ! -f "$LOCAL_SYNC_FILE" ]; then
-        echo "No local sync timestamp, will restore from R2"
-        return 0
+    # Handle existing local workspace (migrate to R2 if needed)
+    if [ -d "$WORKSPACE_LOCAL" ] && [ ! -L "$WORKSPACE_LOCAL" ]; then
+        echo "Migrating existing workspace to R2..."
+        # Use --ignore-existing to not overwrite R2 data
+        if command -v rsync &> /dev/null; then
+            rsync -a --ignore-existing "$WORKSPACE_LOCAL/" "$WORKSPACE_R2/" 2>/dev/null || true
+        else
+            cp -an "$WORKSPACE_LOCAL/." "$WORKSPACE_R2/" 2>/dev/null || true
+        fi
+        rm -rf "$WORKSPACE_LOCAL"
+        echo "Migration complete"
     fi
     
-    # Compare timestamps
-    R2_TIME=$(cat "$R2_SYNC_FILE" 2>/dev/null)
-    LOCAL_TIME=$(cat "$LOCAL_SYNC_FILE" 2>/dev/null)
-    
-    echo "R2 last sync: $R2_TIME"
-    echo "Local last sync: $LOCAL_TIME"
-    
-    # Convert to epoch seconds for comparison
-    R2_EPOCH=$(date -d "$R2_TIME" +%s 2>/dev/null || echo "0")
-    LOCAL_EPOCH=$(date -d "$LOCAL_TIME" +%s 2>/dev/null || echo "0")
-    
-    if [ "$R2_EPOCH" -gt "$LOCAL_EPOCH" ]; then
-        echo "R2 backup is newer, will restore"
-        return 0
+    # Create or fix symlink
+    if [ -L "$WORKSPACE_LOCAL" ]; then
+        CURRENT_TARGET=$(readlink "$WORKSPACE_LOCAL")
+        if [ "$CURRENT_TARGET" != "$WORKSPACE_R2" ]; then
+            echo "Fixing symlink (was: $CURRENT_TARGET)"
+            rm "$WORKSPACE_LOCAL"
+            ln -sf "$WORKSPACE_R2" "$WORKSPACE_LOCAL"
+        fi
     else
-        echo "Local data is newer or same, skipping restore"
-        return 1
+        # Remove any stale file/broken symlink
+        rm -f "$WORKSPACE_LOCAL" 2>/dev/null || true
+        ln -sf "$WORKSPACE_R2" "$WORKSPACE_LOCAL"
     fi
+    
+    echo "Workspace: $WORKSPACE_LOCAL -> $WORKSPACE_R2"
+else
+    echo "WARNING: R2 not mounted at $R2_MOUNT"
+    echo "Workspace will be ephemeral (data lost on restart)"
+    mkdir -p "$WORKSPACE_LOCAL"
+fi
+
+# ============================================================
+# CONFIG RESTORE FROM R2
+# ============================================================
+# Config is backed up to R2 but restored to local filesystem because
+# env vars modify it on each boot.
+
+CONFIG_BACKUP="$R2_MOUNT/clawdbot"
+
+restore_config() {
+    if [ -f "$CONFIG_BACKUP/clawdbot.json" ]; then
+        echo "Restoring config from R2..."
+        cp -a "$CONFIG_BACKUP/." "$CONFIG_DIR/"
+        echo "Config restored"
+        return 0
+    fi
+    return 1
 }
 
-if [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring from R2 backup at $BACKUP_DIR/clawdbot..."
-        cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
-        # Copy the sync timestamp to local so we know what version we have
-        cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
-        echo "Restored config from R2 backup"
-    fi
-elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
-    # Legacy backup format (flat structure)
-    if should_restore_from_r2; then
-        echo "Restoring from legacy R2 backup at $BACKUP_DIR..."
-        cp -a "$BACKUP_DIR/." "$CONFIG_DIR/"
-        cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
-        echo "Restored config from legacy R2 backup"
-    fi
-elif [ -d "$BACKUP_DIR" ]; then
-    echo "R2 mounted at $BACKUP_DIR but no backup data found yet"
-else
-    echo "R2 not mounted, starting fresh"
-fi
-
-# Restore skills from R2 backup if available (only if R2 is newer)
-SKILLS_DIR="/root/clawd/skills"
-if [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring skills from $BACKUP_DIR/skills..."
-        mkdir -p "$SKILLS_DIR"
-        cp -a "$BACKUP_DIR/skills/." "$SKILLS_DIR/"
-        echo "Restored skills from R2 backup"
+if [ -d "$R2_MOUNT" ]; then
+    if [ ! -f "$CONFIG_FILE" ]; then
+        # No local config, try to restore from R2
+        restore_config || echo "No R2 backup found"
+    else
+        # Local config exists - check if R2 is newer
+        R2_SYNC="$R2_MOUNT/.last-sync"
+        LOCAL_SYNC="$CONFIG_DIR/.last-sync"
+        if [ -f "$R2_SYNC" ]; then
+            if [ ! -f "$LOCAL_SYNC" ]; then
+                restore_config
+            else
+                R2_TIME=$(date -d "$(cat "$R2_SYNC")" +%s 2>/dev/null || echo "0")
+                LOCAL_TIME=$(date -d "$(cat "$LOCAL_SYNC")" +%s 2>/dev/null || echo "0")
+                if [ "$R2_TIME" -gt "$LOCAL_TIME" ]; then
+                    restore_config
+                fi
+            fi
+        fi
     fi
 fi
 
-# If config file still doesn't exist, create from template
+# Create config from template if still missing
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "No existing config found, initializing from template..."
+    echo "Initializing config from template..."
     if [ -f "$TEMPLATE_FILE" ]; then
         cp "$TEMPLATE_FILE" "$CONFIG_FILE"
     else
-        # Create minimal config if template doesn't exist
         cat > "$CONFIG_FILE" << 'EOFCONFIG'
 {
   "agents": {
@@ -126,18 +145,15 @@ if [ ! -f "$CONFIG_FILE" ]; then
 }
 EOFCONFIG
     fi
-else
-    echo "Using existing config"
 fi
 
 # ============================================================
 # UPDATE CONFIG FROM ENVIRONMENT VARIABLES
 # ============================================================
-node << EOFNODE
+node << 'EOFNODE'
 const fs = require('fs');
 
 const configPath = '/root/.clawdbot/clawdbot.json';
-console.log('Updating config at:', configPath);
 let config = {};
 
 try {
@@ -154,16 +170,13 @@ config.gateway = config.gateway || {};
 config.channels = config.channels || {};
 
 // Clean up any broken anthropic provider config from previous runs
-// (older versions didn't include required 'name' field)
 if (config.models?.providers?.anthropic?.models) {
     const hasInvalidModels = config.models.providers.anthropic.models.some(m => !m.name);
     if (hasInvalidModels) {
-        console.log('Removing broken anthropic provider config (missing model names)');
+        console.log('Removing broken anthropic provider config');
         delete config.models.providers.anthropic;
     }
 }
-
-
 
 // Gateway configuration
 config.gateway.port = 18789;
@@ -209,15 +222,10 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
 }
 
 // Base URL override (e.g., for Cloudflare AI Gateway)
-// Usage: Set AI_GATEWAY_BASE_URL or ANTHROPIC_BASE_URL to your endpoint like:
-//   https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/anthropic
-//   https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/openai
 const baseUrl = (process.env.AI_GATEWAY_BASE_URL || process.env.ANTHROPIC_BASE_URL || '').replace(/\/+$/, '');
 const isOpenAI = baseUrl.endsWith('/openai');
 
 if (isOpenAI) {
-    // Create custom openai provider config with baseUrl override
-    // Omit apiKey so moltbot falls back to OPENAI_API_KEY env var
     console.log('Configuring OpenAI provider with base URL:', baseUrl);
     config.models = config.models || {};
     config.models.providers = config.models.providers || {};
@@ -230,7 +238,6 @@ if (isOpenAI) {
             { id: 'gpt-4.5-preview', name: 'GPT-4.5 Preview', contextWindow: 128000 },
         ]
     };
-    // Add models to the allowlist so they appear in /models
     config.agents.defaults.models = config.agents.defaults.models || {};
     config.agents.defaults.models['openai/gpt-5.2'] = { alias: 'GPT-5.2' };
     config.agents.defaults.models['openai/gpt-5'] = { alias: 'GPT-5' };
@@ -249,46 +256,50 @@ if (isOpenAI) {
             { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', contextWindow: 200000 },
         ]
     };
-    // Include API key in provider config if set (required when using custom baseUrl)
     if (process.env.ANTHROPIC_API_KEY) {
         providerConfig.apiKey = process.env.ANTHROPIC_API_KEY;
     }
     config.models.providers.anthropic = providerConfig;
-    // Add models to the allowlist so they appear in /models
     config.agents.defaults.models = config.agents.defaults.models || {};
     config.agents.defaults.models['anthropic/claude-opus-4-5-20251101'] = { alias: 'Opus 4.5' };
     config.agents.defaults.models['anthropic/claude-sonnet-4-5-20250929'] = { alias: 'Sonnet 4.5' };
     config.agents.defaults.models['anthropic/claude-haiku-4-5-20251001'] = { alias: 'Haiku 4.5' };
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5-20251101';
 } else {
-    // Default to Anthropic without custom base URL (uses built-in pi-ai catalog)
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5';
 }
 
-// Write updated config
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-console.log('Configuration updated successfully');
-console.log('Config:', JSON.stringify(config, null, 2));
+console.log('Config updated');
 EOFNODE
+
+# ============================================================
+# CUSTOM POST-BOOT HOOK
+# ============================================================
+# Run custom scripts from R2 without needing to redeploy.
+# Create /data/moltbot/hooks/post-boot.sh on R2 to customize.
+
+POST_BOOT_HOOK="$R2_MOUNT/hooks/post-boot.sh"
+if [ -f "$POST_BOOT_HOOK" ]; then
+    echo "Running post-boot hook: $POST_BOOT_HOOK"
+    source "$POST_BOOT_HOOK"
+fi
 
 # ============================================================
 # START GATEWAY
 # ============================================================
-# Note: R2 backup sync is handled by the Worker's cron trigger
-echo "Starting Moltbot Gateway..."
-echo "Gateway will be available on port 18789"
+echo "Starting Moltbot Gateway on port 18789..."
 
 # Clean up stale lock files
 rm -f /tmp/clawdbot-gateway.lock 2>/dev/null || true
 rm -f "$CONFIG_DIR/gateway.lock" 2>/dev/null || true
 
 BIND_MODE="lan"
-echo "Dev mode: ${CLAWDBOT_DEV_MODE:-false}, Bind mode: $BIND_MODE"
 
 if [ -n "$CLAWDBOT_GATEWAY_TOKEN" ]; then
-    echo "Starting gateway with token auth..."
+    echo "Auth: token"
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$CLAWDBOT_GATEWAY_TOKEN"
 else
-    echo "Starting gateway with device pairing (no token)..."
+    echo "Auth: device pairing"
     exec clawdbot gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE"
 fi

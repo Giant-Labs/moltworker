@@ -169,7 +169,7 @@ Local development with `wrangler dev` has issues proxying WebSocket connections 
 The Dockerfile includes a cache bust comment. When changing `moltbot.json.template` or `start-moltbot.sh`, bump the version:
 
 ```dockerfile
-# Build cache bust: 2026-01-26-v10
+# Build cache bust: 2026-02-02-v30-workspace-symlink
 ```
 
 ## Gateway Configuration
@@ -233,14 +233,54 @@ npx wrangler secret list
 
 Enable debug routes with `DEBUG_ROUTES=true` and check `/debug/processes`.
 
-## R2 Storage Notes
+## R2 Storage & Persistence
 
-R2 is mounted via s3fs at `/data/moltbot`. Important gotchas:
+R2 is mounted via s3fs at `/data/moltbot`. The persistence strategy differs by data type:
 
-- **rsync compatibility**: Use `rsync -r --no-times` instead of `rsync -a`. s3fs doesn't support setting timestamps, which causes rsync to fail with "Input/output error".
+### Workspace (Symlink to R2)
 
-- **Mount checking**: Don't rely on `sandbox.mountBucket()` error messages to detect "already mounted" state. Instead, check `mount | grep s3fs` to verify the mount status.
+The workspace at `/root/clawd` is **symlinked directly to R2** at `/data/moltbot/clawd`. This means:
+- All writes persist immediately (no sync delay)
+- No data loss on container restart
+- Skills, memory, output files all live on R2
 
-- **Never delete R2 data**: The mount directory `/data/moltbot` IS the R2 bucket. Running `rm -rf /data/moltbot/*` will DELETE your backup data. Always check mount status before any destructive operations.
+### Config (Backup/Restore)
 
-- **Process status**: The sandbox API's `proc.status` may not update immediately after a process completes. Instead of checking `proc.status === 'completed'`, verify success by checking for expected output (e.g., timestamp file exists after sync).
+The config at `/root/.clawdbot` uses **backup/restore** because:
+- Environment variables modify config on each boot
+- Cron job syncs config to R2 every 5 minutes
+- On boot, config is restored from R2 if newer
+
+### Custom Hooks
+
+To run custom scripts on boot without redeploying:
+1. Create `/data/moltbot/hooks/post-boot.sh` on R2
+2. It will be sourced after config setup, before gateway starts
+3. Use for experiments, temporary fixes, or runtime customizations
+
+### R2 Structure
+
+```
+/data/moltbot/
+├── clawd/           # Workspace (symlinked from /root/clawd)
+│   ├── skills/      # Agent skills
+│   ├── memory/      # Memory files
+│   └── output/      # Generated files
+├── clawdbot/        # Config backup
+│   ├── clawdbot.json
+│   ├── agents/      # Session data
+│   └── devices/     # Paired devices
+├── hooks/           # Custom scripts
+│   └── post-boot.sh # Runs on each boot
+└── .last-sync       # Sync timestamp
+```
+
+### Important Gotchas
+
+- **rsync compatibility**: Use `rsync -r --no-times` instead of `rsync -a`. s3fs doesn't support setting timestamps.
+
+- **Never delete R2 data**: `/data/moltbot` IS the R2 bucket. `rm -rf /data/moltbot/*` will DELETE your data.
+
+- **Mount checking**: Check `mount | grep s3fs` to verify mount status, not `sandbox.mountBucket()` errors.
+
+- **Process status**: The sandbox API's `proc.status` may not update immediately. Verify success by checking for expected output.
