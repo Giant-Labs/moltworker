@@ -62,9 +62,10 @@
       "bucket_name": "moltbot-data",
     },
   ],
-  // Cron trigger to sync moltbot data to R2 every 5 minutes
+  // Cron trigger for health checks and R2 backup every minute
+  // This ensures automatic recovery within 1 minute if the gateway crashes
   "triggers": {
-    "crons": ["*/5 * * * *"],
+    "crons": ["* * * * *"],
   },
   // Browser Rendering binding for CDP shim
   "browser": {

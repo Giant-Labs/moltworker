@@ -417,7 +417,13 @@ app.all('*', async (c) => {
 
 /**
  * Scheduled handler for cron triggers.
- * Syncs moltbot config/state from container to R2 for persistence.
+ * 
+ * This handler runs periodically to:
+ * 1. Ensure the gateway is healthy (auto-recovery after crashes)
+ * 2. Sync moltbot config/state from container to R2 for persistence
+ * 
+ * The health check ensures that if the container or gateway crashes,
+ * it will be automatically restarted within the cron interval (default: 1 minute).
  */
 async function scheduled(
   _event: ScheduledEvent,
@@ -427,6 +433,17 @@ async function scheduled(
   const options = buildSandboxOptions(env);
   const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
 
+  // Ensure gateway is running (auto-recovery after crashes)
+  console.log('[cron] Checking gateway health...');
+  try {
+    await ensureMoltbotGateway(sandbox, env);
+    console.log('[cron] Gateway is healthy');
+  } catch (err) {
+    console.error('[cron] Failed to ensure gateway health:', err);
+    // Continue to R2 sync anyway - it may partially succeed
+  }
+
+  // Sync to R2 for persistence
   console.log('[cron] Starting backup sync to R2...');
   const result = await syncToR2(sandbox, env);
 
